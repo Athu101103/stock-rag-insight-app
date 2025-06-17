@@ -4,8 +4,37 @@ import numpy as np
 import warnings
 from io import BytesIO
 from typing import Dict, Any, List, Tuple
+import requests
+from tenacity import retry, stop_after_attempt, wait_fixed
+import logging
+import re
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Replace with your actual Alpha Vantage API key
+ALPHA_VANTAGE_API_KEY = "L5Z5ABID5UOQ744Q"  # Replace with your API key
 
 warnings.filterwarnings('ignore')
+
+# Helper function to convert NumPy types to Python native types
+def convert_numpy_types(obj):
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_types(item) for item in obj)
+    return obj
 
 def clean_and_convert(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
@@ -142,7 +171,7 @@ def detect_trend_with_reasoning(prices: pd.Series, period: int = 10) -> Tuple[st
     elif slope > -0.05:
         trend = "Sideways"
         reasoning = f"Price is moving sideways with minimal slope of {slope:.4f}. "
-        reasoning += f"Price changed by only {price_change_pct:.2f}% over {period} periods, indicating consolidation. "
+        reasoning += f"Price changed by only {price_change_pct:.2f}% over {period} periods, indicating consolidation."
         reasoning += "Market is likely in a consolidation phase with no clear direction."
     elif slope > -0.1:
         trend = "Downtrend"
@@ -181,23 +210,23 @@ def generate_detailed_signals(df: pd.DataFrame, close_col: str) -> Tuple[List[st
             explanations.append(f"RSI at {rsi:.1f} indicates overbought conditions. RSI above 70 suggests the stock may be overextended and due for a pullback.")
         else:
             signals.append("RSI Neutral")
-            explanations.append(f"RSI at {rsi:.1f} is in neutral territory (30-70), indicating balanced buying and selling pressure with no extreme conditions.")
+            explanations.append(f"RSI at {rsi:.1f} is in neutral territory (30-70), indicating balanced buying and selling pressure.")
     
     macd, signal_line, histogram = calculate_macd(prices)
-    if macd and signal_line:
+    if macd:
         if macd > signal_line and histogram > 0:
             signals.append("MACD Bullish - Potential BUY signal")
-            explanations.append(f"MACD line ({macd:.4f}) is above signal line ({signal_line:.4f}) with positive histogram ({histogram:.4f}). This indicates bullish momentum as the faster moving average is pulling away from the slower one.")
+            explanations.append(f"MACD line ({macd:.4f}) is above signal line ({signal_line:.4f}) with positive histogram ({histogram:.4f}). This indicates bullish momentum as the fast moving average is pulling away from the slow one.")
         elif macd < signal_line and histogram < 0:
             signals.append("MACD Bearish - Potential SELL signal")
             explanations.append(f"MACD line ({macd:.4f}) is below signal line ({signal_line:.4f}) with negative histogram ({histogram:.4f}). This indicates bearish momentum as the faster moving average is diverging downward.")
         else:
             signals.append("MACD Neutral")
-            explanations.append(f"MACD shows mixed signals with line at {macd:.4f} and signal at {signal_line:.4f}. Momentum is unclear, suggesting a wait-and-see approach.")
+            explanations.append(f"MACD shows mixed signals with line at {macd:.4f} and signal line at {signal_line:.4f}. Momentum is unclear, suggesting a wait-and-see approach.")
     
     upper, middle, lower = calculate_bollinger_bands(prices)
-    if upper and lower:
-        bb_position = ((current_price - lower) / (upper - lower)) * 100
+    if upper and middle and lower:
+        bb_position = ((current_price - lower) / (upper - lower)) * 100 if (upper - lower) != 0 else 50
         if current_price > upper:
             signals.append("Price above Bollinger Upper Band - Potential SELL signal")
             explanations.append(f"Price (${current_price:.2f}) is above the upper Bollinger Band (${upper:.2f}), suggesting the stock is statistically overbought. Band position: {bb_position:.1f}%")
@@ -211,7 +240,7 @@ def generate_detailed_signals(df: pd.DataFrame, close_col: str) -> Tuple[List[st
     if len(prices) >= 20:
         ma_5 = prices.rolling(5).mean().iloc[-1]
         ma_20 = prices.rolling(20).mean().iloc[-1]
-        ma_diff_pct = ((ma_5 - ma_20) / ma_20) * 100
+        ma_diff_pct = ((ma_5 - ma_20) / ma_20) * 100 if ma_20 != 0 else 0
         
         if ma_5 > ma_20:
             signals.append("Short MA above Long MA - Bullish signal")
@@ -284,23 +313,23 @@ def compute_advanced_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     
     stats = {
         "Open": round(df.iloc[0][open_col], 2),
-        "Close": round(df.iloc[-1][close_col], 2),
-        "High": round(df[high_col].max(), 2),
-        "Low": round(df[low_col].min(), 2),
-        "Volume": int(df[volume_col].sum()),
+        "Close": round(prices.iloc[-1], 2),
+        "High": round(highs.max(), 2),
+        "Low": round(lows.min(), 2),
+        "Volume": round(df[volume_col].sum(), 2),
     }
     
     price_change = stats["Close"] - stats["Open"]
-    price_change_pct = (price_change / stats["Open"]) * 100
+    price_change_pct = (price_change / stats["Open"] * 100) if stats["Open"] != 0 else 0
     stats["Price Change"] = round(price_change, 2)
     stats["Price Change %"] = round(price_change_pct, 2)
     
     if len(prices) >= 5:
-        stats["5-Period MA"] = round(prices.rolling(5).mean().iloc[-1], 2)
+        stats["5-Period MA"] = round(prices.rolling(window=5).mean().iloc[-1], 2)
     if len(prices) >= 10:
-        stats["10-Period MA"] = round(prices.rolling(10).mean().iloc[-1], 2)
+        stats["10-Period MA"] = round(prices.rolling(window=10).mean().iloc[-1], 2)
     if len(prices) >= 20:
-        stats["20-Period MA"] = round(prices.rolling(20).mean().iloc[-1], 2)
+        stats["20-Period MA"] = round(prices.rolling(window=20).mean().iloc[-1], 2)
         stats["20-Period EMA"] = round(prices.ewm(span=20).mean().iloc[-1], 2)
     
     rsi = calculate_rsi(prices)
@@ -341,10 +370,13 @@ def compute_advanced_statistics(df: pd.DataFrame) -> Dict[str, Any]:
     
     signals, explanations = generate_detailed_signals(df, close_col)
     stats["Trading Signals"] = signals
-    stats["Signal Explanations"] = explanations
+    stats["Explanations"] = explanations
     stats["Signal Summary Note"] = get_signal_summary_note()
     
     stats["Data Points"] = len(df)
+    
+    # Convert NumPy types to Python native types
+    stats = convert_numpy_types(stats)
     
     return stats
 
@@ -354,7 +386,7 @@ def compute_single_price_advanced_stats(df: pd.DataFrame) -> Dict[str, Any]:
                  not any(time_word in col.lower() for time_word in ['date', 'time'])]
     
     if not price_cols:
-        return {"Error": "No price columns found in data."}
+        return {"Error": "No price columns found in data."} 
     
     for col in price_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -432,11 +464,14 @@ def compute_single_price_advanced_stats(df: pd.DataFrame) -> Dict[str, Any]:
     temp_df = pd.DataFrame({'close': price_series})
     signals, explanations = generate_detailed_signals(temp_df, 'close')
     stats["Trading Signals"] = signals
-    stats["Signal Explanations"] = explanations
+    stats["Explanations"] = explanations
     stats["Signal Summary Note"] = get_signal_summary_note()
     
     stats["Data Points"] = len(price_series)
     stats["Price Columns Analyzed"] = price_cols
+    
+    # Convert NumPy types to Python native types
+    stats = convert_numpy_types(stats)
     
     return stats
 
@@ -459,7 +494,7 @@ def analyze_stock_data(data: pd.DataFrame, data_format: str = None) -> Dict[str,
 
 def fetch_and_analyze_stock(symbol: str, period: str = "1d") -> Dict[str, Any]:
     try:
-        interval = "5m" if period == "1d" else "15m"  # dynamic interval
+        interval = "5m" if period == "1d" else "15m"
         stock = yf.Ticker(symbol)
         df = stock.history(period=period, interval=interval)
         
@@ -471,11 +506,13 @@ def fetch_and_analyze_stock(symbol: str, period: str = "1d") -> Dict[str, Any]:
         results["Period"] = period
         results["Interval Used"] = interval
         
+        # Convert NumPy types to Python native types
+        results = convert_numpy_types(results)
+        
         return results
     
     except Exception as e:
         return {"Error": f"Failed to fetch data for {symbol}: {str(e)}"}
-
 
 def load_and_analyze_csv(content: bytes, filename: str) -> Dict[str, Any]:
     try:
@@ -500,6 +537,9 @@ def load_and_analyze_csv(content: bytes, filename: str) -> Dict[str, Any]:
         results = analyze_stock_data(df)
         results["Source"] = filename
         
+        # Convert NumPy types to Python native types
+        results = convert_numpy_types(results)
+        
         return results
     
     except Exception as e:
@@ -511,9 +551,12 @@ def batch_analyze_stocks(symbols: List[str], period: str = "1mo") -> Dict[str, D
     for symbol in symbols:
         try:
             result = fetch_and_analyze_stock(symbol, period)
-            results[symbol] = result
+            results[symbol] = convert_numpy_types(result)
         except Exception as e:
             results[symbol] = {"Error": f"Failed to analyze {symbol}: {str(e)}"}
+    
+    # Convert NumPy types to Python native types
+    results = convert_numpy_types(results)
     
     return results
 
@@ -530,4 +573,166 @@ def get_available_periods() -> Dict[str, str]:
         "10y": "10 years",
         "ytd": "Year to date",
         "max": "Maximum available"
+    }
+
+def validate_symbol(symbol: str) -> bool:
+    if not symbol:
+        raise ValueError("Stock symbol cannot be empty.")
+    if not re.match(r"^[A-Za-z]+$", symbol):
+        raise ValueError("Stock symbol must contain only letters.")
+    return True
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def fetch_stock_news(symbol: str, limit: int = 5) -> List[Dict[str, Any]]:
+    try:
+        validate_symbol(symbol)
+        logger.info(f"Fetching news for symbol {symbol}")
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": symbol.upper(),
+            "apikey": ALPHA_VANTAGE_API_KEY,
+            "limit": 50
+        }
+        response = requests.get(url, params=params)
+        if response.status_code == 429:
+            logger.error("Alpha Vantage rate limit exceeded")
+            return [{"Error": "Rate limit exceeded. Please try again later."}]
+        response.raise_for_status()
+        data = response.json()
+        if "Error Message" in data:
+            logger.error(f"Alpha Vantage API error: {data['Error Message']}")
+            return [{"Error": f"Failed to fetch news: {data['Error Message']}"}]
+        if "Information" in data and "rate limit" in data["Information"].lower():
+            logger.error("Alpha Vantage rate limit exceeded")
+            return [{"Error": "Rate limit exceeded. Please try again later."}]
+        if "feed" not in data or not data["feed"]:
+            logger.warning(f"No news found for symbol {symbol}")
+            return [{"Error": f"No news found for symbol {symbol}"}]
+        news_items = []
+        for item in data["feed"][:limit]:
+            news_item = {
+                "title": item.get("title", "N/A"),
+                "published_at": item.get("time_published", "N/A"),
+                "url": item.get("url", "N/A"),
+                "source": item.get("source", "N/A"),
+                "summary": item.get("summary", "N/A"),
+                "sentiment_score": item.get("overall_sentiment_score", "N/A"),
+                "sentiment_label": item.get("overall_sentiment_label", "N/A")
+            }
+            news_items.append(news_item)
+        logger.info(f"Successfully fetched {len(news_items)} news items for {symbol}")
+        return news_items
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching news for {symbol}: {str(e)}")
+        return [{"Error": f"Failed to fetch news for {symbol}: {str(e)}"}]
+    except ValueError as e:
+        logger.error(f"Invalid symbol {symbol}: {str(e)}")
+        return [{"Error": str(e)}]
+    except Exception as e:
+        logger.error(f"Unexpected error fetching news for {symbol}: {str(e)}")
+        return [{"Error": f"Unexpected error: {str(e)}"}]
+
+# FastAPI application
+app = FastAPI(
+    title="Advanced Stock Analysis API",
+    description="API for performing advanced stock intraday data analysis with technical indicators, trading signals, and stock news.",
+    version="1.0.0"
+)
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to the Advanced Stock Analysis API",
+        "endpoints": {
+            "/analyze_stock": "Analyze a single stock via Yahoo Finance (GET)",
+            "/analyze_csv": "Analyze a stock by uploading a CSV file (POST)",
+            "/compare_stocks": "Compare multiple stocks via Yahoo Finance (GET)",
+            "/available_periods": "List available periods for Yahoo Finance data (GET)",
+            "/fetch_stock_news": "Fetch recent news for a stock via Alpha Vantage (GET)"
+        },
+        "disclaimer": "This analysis is for educational purposes only. Not financial advice."
+    }
+
+@app.get("/analyze_stock")
+async def analyze_stock(symbol: str, period: str = "1d"):
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Stock symbol is required.")
+    
+    available_periods = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+    if period not in available_periods:
+        raise HTTPException(status_code=400, detail=f"Invalid period. Available periods: {', '.join(available_periods)}")
+    
+    results = fetch_and_analyze_stock(symbol, period)
+    if "Error" in results:
+        raise HTTPException(status_code=400, detail=results["Error"])
+    
+    return results
+
+@app.post("/analyze_csv")
+async def analyze_csv(file: UploadFile = File(...)):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="File must be a CSV.")
+    
+    content = await file.read()
+    results = load_and_analyze_csv(content, file.filename)
+    if "Error" in results:
+        raise HTTPException(status_code=400, detail=results["Error"])
+    
+    return results
+
+@app.get("/compare_stocks")
+async def compare_stocks(symbols: str, period: str = "1d"):
+    if not symbols:
+        raise HTTPException(status_code=400, detail="At least one stock symbol is required.")
+    
+    available_periods = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+    if period not in available_periods:
+        raise HTTPException(status_code=400, detail=f"Invalid period. Available periods: {', '.join(available_periods)}")
+    
+    symbol_list = [s.strip().upper() for s in symbols.split(",")]
+    if not symbol_list:
+        raise HTTPException(status_code=400, detail="Invalid symbol list format.")
+    
+    results = batch_analyze_stocks(symbol_list, period)
+    
+    comparison_data = []
+    metrics = ["Close", "Price Change %", "RSI (14)", "Trend", "Volatility (20-day)"]
+    
+    for symbol, data in results.items():
+        if "Error" not in data:
+            row = {"Symbol": symbol}
+            for metric in metrics:
+                if metric in data:
+                    row[metric] = data[metric]
+                else:
+                    row[metric] = "N/A"
+            comparison_data.append(row)
+        else:
+            comparison_data.append({"Symbol": symbol, "Error": data["Error"]})
+    
+    return {
+        "Comparison Table": comparison_data,
+        "Detailed Results": results
+    }
+
+@app.get("/available_periods")
+async def get_periods():
+    return get_available_periods()
+
+@app.get("/fetch_stock_news")
+async def get_stock_news(symbol: str, limit: int = 5):
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Stock symbol is required.")
+    
+    if limit < 1 or limit > 50:
+        raise HTTPException(status_code=400, detail="Limit must be between 1 and 50.")
+    
+    results = fetch_stock_news(symbol, limit)
+    if isinstance(results, list) and len(results) > 0 and "Error" in results[0]:
+        raise HTTPException(status_code=400, detail=results[0]["Error"])
+    
+    return {
+        "Symbol": symbol.upper(),
+        "News Items": results
     }
