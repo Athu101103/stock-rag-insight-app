@@ -1,6 +1,10 @@
 # Environment variables
 .env
 
+#virtual environment directories
+venv/
+
+
 # ChromaDB persistence directory
 chroma_db/
 
