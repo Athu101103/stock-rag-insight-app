@@ -97,13 +97,10 @@ streamlit run rag_stock_analysis.py
 
 ## 🖼️ Screenshots
 
-> Add these in a folder named `assets/` and link them here:
-
-
 ![Dashboard](dashboard.png)
-![Analysis](analysis.png)
-![Charts](assets/charts.png)
-![Q&A](assets/query.png)
+![News](news.png)
+![Charts](charts.png)
+![Q&A](query.png)
 
 ---
 
