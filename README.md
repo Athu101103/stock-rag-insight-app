@@ -100,8 +100,8 @@ streamlit run rag_stock_analysis.py
 > Add these in a folder named `assets/` and link them here:
 
 ```markdown
-![Dashboard](D:/PROJ/assets/charts.png)
-![Analysis](assets/analysis.png)
+![Dashboard](dashboard.png)
+![Analysis](analysis.png)
 ![Charts](assets/charts.png)
 ![Q&A](assets/query.png)
 ```
