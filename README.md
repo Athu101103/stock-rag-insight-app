@@ -95,12 +95,26 @@ streamlit run rag_stock_analysis.py
 
 ---
 
-## 🖼️ Screenshots
+## 📷 Screenshots
 
+### 🏠 Dashboard
 ![Dashboard](dashboard.png)
+
+---
+
+### 🗞️ News Panel
 ![News](news.png)
+
+---
+
+### 📈 Charts
 ![Charts](charts.png)
+
+---
+
+### 💬 Q&A Section
 ![Q&A](query.png)
+
 
 ---
 
